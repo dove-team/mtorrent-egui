@@ -636,7 +636,7 @@ pub fn run() -> io::Result<()> {
     };
 
     eframe::run_native(
-        "mtorrent",
+        &format!("mtorrent {}", env!("CARGO_PKG_VERSION")),
         options,
         Box::new(|cc| {
             install_fonts(&cc.egui_ctx);

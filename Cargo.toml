@@ -1,6 +1,6 @@
 [package]
 name = "mtorrent-egui"
-version = "0.1.10"
+version = "0.10.1"
 description = "egui version for mtorrent"
 edition = "2024"
 authors = ["Mikhail Vasilyev <mikail.vasilyev@gmail.com>"]
@@ -16,8 +16,8 @@ dirs-next = "2.0.0"
 file-rotate = "0.8.0"
 env_logger = "0.11.11"
 parking_lot = "0.13.0"
-tokio = { version = "1.54.1", features = ["rt", "sync"] }
 eframe = { version = "0.37.0", features = ["default"] }
+tokio = { version = "1.54.1", features = ["rt", "sync"] }
 
 [dev-dependencies]
 egui_kittest = { version = "0.37.0", features = ["eframe"] }
