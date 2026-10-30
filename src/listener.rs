@@ -1,5 +1,6 @@
 use mtorrent::utils::listener::{StateListener, StateSnapshot};
-use std::{ops::ControlFlow, sync::Arc, time::Duration};
+use std::{future::Future, time::Duration};
+use tokio::sync::oneshot;
 
 struct DumpSnapshot {
     level: log::Level,
@@ -8,48 +9,42 @@ struct DumpSnapshot {
 
 pub struct Listener {
     callback: Box<dyn Fn(&StateSnapshot<'_>) + Send>,
-    token: Arc<()>,
     dump_cfg: Option<DumpSnapshot>,
 }
 
-pub struct Canceller {
-    token: Arc<()>,
-}
+pub type Canceller = oneshot::Sender<()>;
 
-pub fn listener_with_canceller<F>(callback: F, dump_level: log::Level) -> (Listener, Canceller)
+pub fn listener_with_canceller<F>(
+    callback: F,
+    dump_level: log::Level,
+) -> (Listener, Canceller, impl Future<Output = ()>)
 where
     F: Fn(&StateSnapshot<'_>) + Send + 'static,
 {
-    let canceller = Canceller {
-        token: Arc::new(()),
-    };
+    let (canceller, cancelled) = oneshot::channel();
     let listener = Listener {
         callback: Box::new(callback),
-        token: canceller.token.clone(),
         dump_cfg: log::log_enabled!(dump_level).then_some(DumpSnapshot {
             level: dump_level,
             ticks: 0,
         }),
     };
-    (listener, canceller)
+    (listener, canceller, async {
+        let _ = cancelled.await;
+    })
 }
 
 impl StateListener for Listener {
     const INTERVAL: Duration = Duration::from_secs(1);
 
-    fn on_snapshot(&mut self, snapshot: StateSnapshot<'_>) -> ControlFlow<()> {
-        if Arc::strong_count(&self.token) == 1 {
-            ControlFlow::Break(())
-        } else {
-            if let Some(dump) = &mut self.dump_cfg {
-                // dump snapshot every 10s
-                dump.ticks = dump.ticks.wrapping_add(1);
-                if dump.ticks % 10 == 0 {
-                    log::log!(dump.level, "{snapshot}");
-                }
+    fn on_snapshot(&mut self, snapshot: StateSnapshot<'_>) {
+        if let Some(dump) = &mut self.dump_cfg {
+            // dump snapshot every 10s
+            dump.ticks = dump.ticks.wrapping_add(1);
+            if dump.ticks.is_multiple_of(10) {
+                log::log!(dump.level, "{snapshot}");
             }
-            (self.callback)(&snapshot);
-            ControlFlow::Continue(())
         }
+        (self.callback)(&snapshot);
     }
 }

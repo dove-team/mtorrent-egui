@@ -1,0 +1,31 @@
+task:
+  add: "Добавить новую загрузку"
+  remove: "Удалить"
+  default_name: "Задание %{id}"
+  download_name: "Загрузка %{id}"
+  magnet_label: "Магнит-ссылка или путь к файлу:"
+  select_file: "Выбрать…"
+  torrent_filter: "Торрент-файлы"
+  start: "Начать загрузку"
+  stop: "Остановить загрузку"
+
+status:
+  idle: Ожидание
+  loading: Загрузка…
+  downloading: Скачивание
+  stopped: Остановлено
+  completed: Завершено
+  failed: Ошибка
+  line: "Статус: %{status} | Загружено: %{downloaded} / %{total} (%{kib})"
+
+peers:
+  heading: "Подключённые пиры:"
+  unknown_client: неизвестно
+  address: Адрес
+  client: Клиент
+  origin: Источник
+  protocol: Протокол
+  downloaded: Загружено
+  uploaded: Отдано
+
+language: Язык

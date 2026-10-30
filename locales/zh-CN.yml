@@ -1,0 +1,31 @@
+task:
+  add: "新建下载任务"
+  remove: "移除"
+  default_name: "任务 %{id}"
+  download_name: "下载 %{id}"
+  magnet_label: "磁力链接或文件路径："
+  select_file: "选择…"
+  torrent_filter: "种子文件"
+  start: "开始下载"
+  stop: "停止下载"
+
+status:
+  idle: 空闲
+  loading: 正在加载…
+  downloading: 下载中
+  stopped: 已停止
+  completed: 已完成
+  failed: 失败
+  line: "状态：%{status} | 已下载：%{downloaded} / %{total}（%{kib}）"
+
+peers:
+  heading: "已连接节点："
+  unknown_client: 未知
+  address: 地址
+  client: 客户端
+  origin: 来源
+  protocol: 协议
+  downloaded: 已下载
+  uploaded: 已上传
+
+language: 语言
