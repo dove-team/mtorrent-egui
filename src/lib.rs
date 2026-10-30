@@ -6,34 +6,42 @@ rust_i18n::i18n!("locales", fallback = "en");
 use crate::listener::{Canceller, listener_with_canceller};
 use crate::logging::{Config, setup_log_rotation};
 use eframe::egui;
-use mtorrent::utils::re_exports::mtorrent_core::pwp::TransportProto;
+use mtorrent::utils::re_exports::mtorrent_core::pwp::{PeerOrigin, TransportProto};
 use mtorrent::utils::re_exports::mtorrent_dht as dht;
 use mtorrent::utils::re_exports::mtorrent_utils::{peer_id::PeerId, worker};
 use mtorrent::{app, utils};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use rust_i18n::t;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use std::{env, io};
 
 const UPNP_ENABLED: bool = true;
 
+const INSTANCE_GUARD_ADDR: &str = "127.0.0.1:49731";
+const EXIT_WAIT: Duration = Duration::from_secs(5);
+
 const CJK_FONT: &[u8] = include_bytes!("../locales/NotoSerifCJK.ttc");
 const CJK_FONT_INDEX: u32 = 2;
+const EMOJI_FONT: &[u8] = include_bytes!("../locales/NotoEmoji.ttf");
 
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let mut cjk = egui::FontData::from_static(CJK_FONT);
     cjk.index = CJK_FONT_INDEX;
     fonts.font_data.insert("cjk".to_owned(), Arc::new(cjk));
+    fonts.font_data.insert(
+        "emoji".to_owned(),
+        Arc::new(egui::FontData::from_static(EMOJI_FONT)),
+    );
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .push("cjk".to_owned());
+        let fallbacks = fonts.families.entry(family).or_default();
+        fallbacks.push("cjk".to_owned());
+        fallbacks.push("emoji".to_owned());
     }
     ctx.set_fonts(fonts);
 }
@@ -50,11 +58,28 @@ fn locale_name(locale: &str) -> &str {
 
 #[derive(Clone, Debug)]
 struct PeerInfo {
-    client: String,
-    origin: String,
+    client: Option<String>,
+    origin: PeerOrigin,
     proto: String,
     downloaded: u64,
     uploaded: u64,
+}
+
+fn origin_label(origin: PeerOrigin) -> Cow<'static, str> {
+    match origin {
+        PeerOrigin::Tracker => t!("peers.origin_tracker"),
+        PeerOrigin::Listener => t!("peers.origin_listener"),
+        PeerOrigin::Pex => t!("peers.origin_pex"),
+        PeerOrigin::Dht => t!("peers.origin_dht"),
+        PeerOrigin::Other => t!("peers.origin_other"),
+    }
+}
+
+fn decimal_separator() -> char {
+    match &*rust_i18n::locale() {
+        "ru" => ',',
+        _ => '.',
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -84,8 +109,11 @@ impl TaskStatus {
 struct DownloadProgress {
     total_bytes: u64,
     downloaded_bytes: u64,
+    metadata_total: usize,
+    metadata_downloaded: usize,
     peers: BTreeMap<String, PeerInfo>,
     status: TaskStatus,
+    run_id: u64,
 }
 
 impl Default for DownloadProgress {
@@ -93,8 +121,11 @@ impl Default for DownloadProgress {
         Self {
             total_bytes: 0,
             downloaded_bytes: 0,
+            metadata_total: 0,
+            metadata_downloaded: 0,
             peers: BTreeMap::new(),
             status: TaskStatus::Idle,
+            run_id: 0,
         }
     }
 }
@@ -143,6 +174,7 @@ struct MtorrentApp {
     dht_cmd_sender: dht::CommandSink,
     cli_arg: Option<String>,
     net_if: Option<String>,
+    in_flight: Arc<(Mutex<usize>, Condvar)>,
 }
 
 impl MtorrentApp {
@@ -166,6 +198,7 @@ impl MtorrentApp {
             dht_cmd_sender,
             cli_arg,
             net_if,
+            in_flight: Arc::new((Mutex::new(0), Condvar::new())),
         };
 
         // Handle CLI arg if provided
@@ -208,12 +241,17 @@ impl MtorrentApp {
     fn stop_download(&mut self, index: usize) {
         if let Some(task) = self.active_downloads.get_mut(index) {
             task.canceller = None;
-            task.progress.lock().status = TaskStatus::Stopped;
+            let mut progress = task.progress.lock();
+            progress.run_id = progress.run_id.wrapping_add(1);
+            progress.status = TaskStatus::Stopped;
         }
     }
 
     fn save_language(&self, locale: &str) {
-        if let Err(e) = std::fs::write(self.local_data_dir.join("lang"), locale) {
+        let path = self.local_data_dir.join("lang");
+        let tmp = self.local_data_dir.join("lang.tmp");
+        let result = std::fs::write(&tmp, locale).and_then(|()| std::fs::rename(&tmp, &path));
+        if let Err(e) = result {
             log::warn!("Failed to save language preference: {e}");
         }
     }
@@ -225,8 +263,16 @@ impl MtorrentApp {
 
         task.uri = uri.clone();
         task.output_dir = output_dir.clone();
-        task.progress.lock().status = TaskStatus::Loading;
         task.name = utils::startup::get_torrent_name(&uri);
+
+        let run_id = {
+            let mut progress = task.progress.lock();
+            progress.run_id = progress.run_id.wrapping_add(1);
+            progress.status = TaskStatus::Loading;
+            progress.metadata_total = 0;
+            progress.metadata_downloaded = 0;
+            progress.run_id
+        };
 
         let progress = Arc::clone(&task.progress);
         let metainfo_uri = uri.clone();
@@ -235,24 +281,29 @@ impl MtorrentApp {
         let pwp_runtime_handle = self.pwp_runtime_handle.clone();
         let storage_runtime_handle = self.storage_runtime_handle.clone();
         let dht_cmd_sender = self.dht_cmd_sender.clone();
+        let repaint_ctx = ctx.clone();
 
         // Store canceller first
         let (listener, canceller, cancel) = listener_with_canceller(
             move |snapshot| {
                 ctx.request_repaint();
                 let mut prog = progress.lock();
+                if prog.run_id != run_id {
+                    return;
+                }
 
                 prog.total_bytes = snapshot.bytes.total as u64;
                 prog.downloaded_bytes = snapshot.bytes.downloaded as u64;
+                prog.metadata_total = snapshot.metainfo.total_pieces;
+                prog.metadata_downloaded = snapshot.metainfo.downloaded_pieces;
 
                 prog.peers.clear();
                 for (addr, state) in &snapshot.peers {
                     let peer_info = PeerInfo {
                         client: state.extensions.as_ref()
                             .and_then(|ext| ext.client_type.as_deref())
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| t!("peers.unknown_client").into_owned()),
-                        origin: format!("{:?}", state.origin),
+                            .map(str::to_owned),
+                        origin: state.origin,
                         proto: protocol_string(state.transport, state.encryption),
                         downloaded: state.download.bytes_received as u64,
                         uploaded: state.upload.bytes_sent as u64,
@@ -260,12 +311,21 @@ impl MtorrentApp {
                     prog.peers.insert(addr.to_string(), peer_info);
                 }
 
-                prog.status = TaskStatus::Downloading;
+                prog.status = if snapshot.metainfo.total_pieces > 0
+                    && snapshot.metainfo.downloaded_pieces < snapshot.metainfo.total_pieces
+                {
+                    TaskStatus::Loading
+                } else {
+                    TaskStatus::Downloading
+                };
             },
             log::Level::Debug,
         );
 
         task.canceller = Some(canceller);
+
+        *self.in_flight.0.lock() += 1;
+        let in_flight = Arc::clone(&self.in_flight);
 
         // Spawn download task on the main runtime's thread
         let net_if = self.net_if.clone();
@@ -295,21 +355,33 @@ impl MtorrentApp {
                 )
                 .await;
 
-                let mut progress = progress.lock();
-                progress.peers.clear();
-                match result {
-                    Ok(app::main::Outcome::Finished) => {
-                        log::info!("Download completed: {}", metainfo_uri);
-                        progress.status = TaskStatus::Completed;
-                    }
-                    Ok(app::main::Outcome::Cancelled) => {
-                        progress.status = TaskStatus::Stopped;
-                    }
-                    Err(e) => {
-                        log::error!("Download failed: {} - {}", metainfo_uri, e);
-                        progress.status = TaskStatus::Failed;
+                {
+                    let mut progress = progress.lock();
+                    if progress.run_id == run_id {
+                        progress.peers.clear();
+                        progress.metadata_total = 0;
+                        progress.metadata_downloaded = 0;
+                        match result {
+                            Ok(app::main::Outcome::Finished) => {
+                                log::info!("Download completed: {}", metainfo_uri);
+                                progress.status = TaskStatus::Completed;
+                            }
+                            Ok(app::main::Outcome::Cancelled) => {
+                                progress.status = TaskStatus::Stopped;
+                            }
+                            Err(e) => {
+                                log::error!("Download failed: {} - {}", metainfo_uri, e);
+                                progress.status = TaskStatus::Failed;
+                            }
+                        }
                     }
                 }
+                repaint_ctx.request_repaint();
+
+                let (lock, condvar) = &*in_flight;
+                let mut active = lock.lock();
+                *active = active.saturating_sub(1);
+                condvar.notify_all();
             });
         });
     }
@@ -318,16 +390,22 @@ impl MtorrentApp {
         if bytes == 0 {
             return "0 B".to_string();
         }
-        const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+        const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
         let k = 1024f64;
         let i = (bytes as f64).log(k) as usize;
         let i = i.min(UNITS.len() - 1);
         let value = bytes as f64 / k.powi(i as i32);
-        if value < 10.0 {
-            format!("{:.1} {}", value, UNITS[i])
+        let value = if value < 10.0 {
+            format!("{value:.1}")
         } else {
-            format!("{:.0} {}", value, UNITS[i])
-        }
+            format!("{value:.0}")
+        };
+        let value = if decimal_separator() == ',' {
+            value.replace('.', ",")
+        } else {
+            value
+        };
+        format!("{value} {}", UNITS[i])
     }
 
     fn format_bytes_kib(bytes: u64) -> String {
@@ -446,16 +524,24 @@ impl eframe::App for MtorrentApp {
                         // Progress
                         let progress = task.progress.lock();
                         let pct = if progress.total_bytes > 0 {
-                            (progress.downloaded_bytes as f64 / progress.total_bytes as f64 * 100.0).min(100.0)
+                            progress.downloaded_bytes as f64 / progress.total_bytes as f64 * 100.0
+                        } else if progress.metadata_total > 0 {
+                            progress.metadata_downloaded as f64 / progress.metadata_total as f64
+                                * 100.0
                         } else {
                             0.0
+                        }
+                        .min(100.0);
+                        let pct_text = if decimal_separator() == ',' {
+                            format!("{pct:.1}%").replace('.', ",")
+                        } else {
+                            format!("{pct:.1}%")
                         };
 
                         ui.add_space(10.0);
                         
                         // Progress bar
-                        let progress_bar = egui::ProgressBar::new(pct as f32 / 100.0)
-                            .text(format!("{:.1}%", pct));
+                        let progress_bar = egui::ProgressBar::new(pct as f32 / 100.0).text(pct_text);
                         ui.add(progress_bar);
 
                         // Status
@@ -472,8 +558,8 @@ impl eframe::App for MtorrentApp {
                             ui.add_space(10.0);
                             ui.label(t!("peers.heading"));
                             
-                            egui::ScrollArea::vertical().id_salt(idx).max_height(200.0).show(ui, |ui| {
-                                egui::Grid::new(format!("peers_table_{}", idx))
+                            egui::ScrollArea::vertical().id_salt(task.id).max_height(200.0).show(ui, |ui| {
+                                egui::Grid::new(format!("peers_table_{}", task.id))
                                     .num_columns(6)
                                     .spacing([10.0, 4.0])
                                     .striped(true)
@@ -489,9 +575,13 @@ impl eframe::App for MtorrentApp {
 
                                         // Rows
                                         for (addr, peer) in &progress.peers {
+                                            let client = match &peer.client {
+                                                Some(client) => Cow::Borrowed(client.as_str()),
+                                                None => t!("peers.unknown_client"),
+                                            };
                                             ui.label(addr);
-                                            ui.label(&peer.client);
-                                            ui.label(&peer.origin);
+                                            ui.label(client);
+                                            ui.label(origin_label(peer.origin));
                                             ui.label(&peer.proto);
                                             ui.label(Self::format_bytes(peer.downloaded));
                                             ui.label(Self::format_bytes(peer.uploaded));
@@ -506,14 +596,14 @@ impl eframe::App for MtorrentApp {
                 }
 
                 // Handle actions after iteration
-                if let Some(idx) = task_to_remove {
-                    self.remove_task(idx);
+                for idx in tasks_to_stop {
+                    self.stop_download(idx);
                 }
                 for (idx, uri, output_dir) in tasks_to_start {
                     self.start_download(idx, uri, output_dir, ui.ctx().clone());
                 }
-                for idx in tasks_to_stop {
-                    self.stop_download(idx);
+                if let Some(idx) = task_to_remove {
+                    self.remove_task(idx);
                 }
             });
         });
@@ -523,6 +613,17 @@ impl eframe::App for MtorrentApp {
         // Stop all downloads
         for idx in 0..self.active_downloads.len() {
             self.stop_download(idx);
+        }
+
+        // Wait briefly for cancelled downloads to finish their cleanup.
+        let (lock, condvar) = &*self.in_flight;
+        let mut active = lock.lock();
+        let deadline = Instant::now() + EXIT_WAIT;
+        while *active > 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || condvar.wait_for(&mut active, remaining).timed_out() {
+                break;
+            }
         }
     }
 }
@@ -573,6 +674,17 @@ pub fn run() -> io::Result<()> {
             rust_i18n::set_locale(saved);
         }
     }
+
+    let _instance_guard = match TcpListener::bind(INSTANCE_GUARD_ADDR) {
+        Ok(guard) => guard,
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                t!("errors.already_running").into_owned(),
+            ));
+        }
+        Err(e) => return Err(e),
+    };
     
     println!("Log directory: {}", local_data_dir.display());
 
@@ -671,10 +783,10 @@ mod tests {
     fn format_bytes() {
         assert_eq!(MtorrentApp::format_bytes(0), "0 B");
         assert_eq!(MtorrentApp::format_bytes(512), "512 B");
-        assert_eq!(MtorrentApp::format_bytes(1024), "1.0 KB");
-        assert_eq!(MtorrentApp::format_bytes(1024 * 1024), "1.0 MB");
-        assert_eq!(MtorrentApp::format_bytes(1024 * 1024 * 1024), "1.0 GB");
-        assert_eq!(MtorrentApp::format_bytes(1024u64 * 1024 * 1024 * 1024), "1.0 TB");
+        assert_eq!(MtorrentApp::format_bytes(1024), "1.0 KiB");
+        assert_eq!(MtorrentApp::format_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(MtorrentApp::format_bytes(1024 * 1024 * 1024), "1.0 GiB");
+        assert_eq!(MtorrentApp::format_bytes(1024u64 * 1024 * 1024 * 1024), "1.0 TiB");
 
         assert_eq!(MtorrentApp::format_bytes_kib(0), "0 KiB");
         assert_eq!(MtorrentApp::format_bytes_kib(1024 * 1024), "1 024 KiB");
@@ -805,8 +917,8 @@ mod tests {
             progress.peers.insert(
                 "10.0.0.1:51413".to_string(),
                 PeerInfo {
-                    client: "Transmission".to_string(),
-                    origin: "DHT".to_string(),
+                    client: Some("Transmission".to_string()),
+                    origin: PeerOrigin::Dht,
                     proto: "TCP (S)".to_string(),
                     downloaded: 1024 * 512,
                     uploaded: 1024 * 64,
@@ -815,8 +927,8 @@ mod tests {
             progress.peers.insert(
                 "192.168.1.50:6881".to_string(),
                 PeerInfo {
-                    client: "qBittorrent".to_string(),
-                    origin: "Tracker".to_string(),
+                    client: Some("qBittorrent".to_string()),
+                    origin: PeerOrigin::Tracker,
                     proto: "uTP".to_string(),
                     downloaded: 1024 * 1024 * 2,
                     uploaded: 1024 * 128,
@@ -829,7 +941,7 @@ mod tests {
 
         // Verify progress info
         harness.get_by_label_contains("Status: Downloading");
-        harness.get_by_label_contains("3.0 MB");
+        harness.get_by_label_contains("3.0 MiB");
 
         // Verify peers table header
         harness.get_by_label("Connected Peers:");
@@ -842,5 +954,42 @@ mod tests {
         harness.get_by_label("Tracker");
         harness.get_by_label("uTP");
         harness.get_by_label("TCP (S)");
+    }
+
+    #[test]
+    fn app_metadata_progress_uses_pieces() {
+        let (_rt, mut harness) = make_test_harness(None);
+
+        harness.get_by_label("Add New Download Task").click();
+        harness.run();
+
+        {
+            let app = harness.state_mut();
+            let task = &mut app.active_downloads[0];
+            let mut progress = task.progress.lock();
+            progress.metadata_total = 10;
+            progress.metadata_downloaded = 3;
+            progress.status = TaskStatus::Loading;
+        }
+
+        harness.run();
+        harness.get_by_label_contains("Status: Loading");
+        harness.get_by_label_contains("30.0%");
+    }
+
+    #[test]
+    fn app_renders_emoji_in_task_name() {
+        let (_rt, mut harness) = make_test_harness(None);
+
+        harness.get_by_label("Add New Download Task").click();
+        harness.run();
+
+        {
+            let app = harness.state_mut();
+            app.active_downloads[0].name = Some("🧲 torrent".to_string());
+        }
+
+        harness.run();
+        harness.get_by_label_contains("🧲");
     }
 }

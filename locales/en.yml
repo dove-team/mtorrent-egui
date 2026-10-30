@@ -27,5 +27,13 @@ peers:
   protocol: Protocol
   downloaded: Downloaded
   uploaded: Uploaded
+  origin_tracker: Tracker
+  origin_listener: Listener
+  origin_pex: PEX
+  origin_dht: DHT
+  origin_other: Other
+
+errors:
+  already_running: "mtorrent is already running."
 
 language: Language

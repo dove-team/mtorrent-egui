@@ -27,5 +27,13 @@ peers:
   protocol: 協議
   downloaded: 已下載
   uploaded: 已上傳
+  origin_tracker: 追蹤器
+  origin_listener: 監聽
+  origin_pex: PEX
+  origin_dht: DHT
+  origin_other: 其他
+
+errors:
+  already_running: "mtorrent 已在執行。"
 
 language: 語言

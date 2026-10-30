@@ -27,5 +27,13 @@ peers:
   protocol: Протокол
   downloaded: Загружено
   uploaded: Отдано
+  origin_tracker: Трекер
+  origin_listener: Слушатель
+  origin_pex: PEX
+  origin_dht: DHT
+  origin_other: Другое
+
+errors:
+  already_running: "mtorrent уже запущен."
 
 language: Язык
