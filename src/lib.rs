@@ -219,11 +219,10 @@ impl MtorrentApp {
     }
 
     fn start_download(&mut self, index: usize, uri: String, output_dir: PathBuf, ctx: egui::Context) {
-        if index >= self.active_downloads.len() {
+        let Some(task) = self.active_downloads.get_mut(index) else {
             return;
-        }
+        };
 
-        let task = &mut self.active_downloads[index];
         task.uri = uri.clone();
         task.output_dir = output_dir.clone();
         task.progress.lock().status = TaskStatus::Loading;
@@ -332,8 +331,16 @@ impl MtorrentApp {
     }
 
     fn format_bytes_kib(bytes: u64) -> String {
-        let kib = bytes / 1024;
-        format!("{} KiB", kib.to_string().as_bytes().rchunks(3).rev().map(|chunk| std::str::from_utf8(chunk).unwrap()).collect::<Vec<_>>().join(" "))
+        let kib = (bytes / 1024).to_string();
+        let mut grouped = String::with_capacity(kib.len() + 8);
+        for (i, ch) in kib.chars().enumerate() {
+            if i > 0 && (kib.len() - i).is_multiple_of(3) {
+                grouped.push(' ');
+            }
+            grouped.push(ch);
+        }
+        grouped.push_str(" KiB");
+        grouped
     }
 }
 
@@ -389,7 +396,11 @@ impl eframe::App for MtorrentApp {
 
                 for (idx, task) in self.active_downloads.iter_mut().enumerate() {
                     let progress = task.progress.lock();
-                    let is_downloading = task.canceller.is_some();
+                    let is_downloading = task.canceller.is_some()
+                        && matches!(
+                            progress.status,
+                            TaskStatus::Loading | TaskStatus::Downloading
+                        );
                     let task_name = task.display_name().into_owned();
                     drop(progress);
 
@@ -569,7 +580,9 @@ pub fn run() -> io::Result<()> {
     setup_logging(&local_data_dir)?;
 
     // Get CLI arg
-    let cli_arg = env::args().nth(1);
+    let cli_arg = env::args_os()
+        .nth(1)
+        .map(|arg| arg.to_string_lossy().into_owned());
 
     // Create workers
     let main_worker = worker::with_local_runtime(worker::rt::Config {
@@ -717,6 +730,26 @@ mod tests {
         harness.get_by_label("Magnet link or file path:");
         harness.get_by_label("Start Download");
         harness.get_by_label_contains("Status: Idle");
+    }
+
+    #[test]
+    fn app_completed_task_shows_start_again() {
+        let (_rt, mut harness) = make_test_harness(None);
+
+        harness.get_by_label("Add New Download Task").click();
+        harness.run();
+
+        {
+            let app = harness.state_mut();
+            let task = &mut app.active_downloads[0];
+            let (canceller, _cancelled) = tokio::sync::oneshot::channel();
+            task.canceller = Some(canceller);
+            task.progress.lock().status = TaskStatus::Completed;
+        }
+
+        harness.run();
+        harness.get_by_label("Start Download");
+        assert!(harness.query_by_label("Stop Download").is_none());
     }
 
     #[test]

@@ -37,12 +37,13 @@ impl io::Write for LogSink {
         let LogSink(state) = self;
         let mut locked_buffer = state.buffer.lock();
 
-        let remaining_capacity = state.config.buffer_capacity - locked_buffer.len();
+        let remaining_capacity = state.config.buffer_capacity.saturating_sub(locked_buffer.len());
         if remaining_capacity == 0 {
             // overwrite the end of the buffer with an error message
             let error_msg = b"\nERROR: logger queue is full, dropping messages\n";
-            let start_ind = locked_buffer.len() - error_msg.len();
-            locked_buffer[start_ind..].copy_from_slice(error_msg);
+            if let Some(start_ind) = locked_buffer.len().checked_sub(error_msg.len()) {
+                locked_buffer[start_ind..].copy_from_slice(error_msg);
+            }
 
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "log message queue is full"));
         }
